@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from typing import Optional, Tuple
 from pathlib import Path
+from safetensors.torch import load_file
 
 from chatterbox.tts import ChatterboxTTS  # Main TTS engine class
 from chatterbox.models.s3gen.const import (
@@ -235,8 +236,8 @@ def get_model_info() -> dict:
 def load_model() -> bool:
     """
     Loads the TTS model.
-    This version directly attempts to load from the Hugging Face repository (or its cache)
-    using `from_pretrained`, bypassing the local `paths.model_cache` directory.
+    This version supports both loading from Hugging Face Hub (via from_pretrained)
+    and from a local checkpoint directory (via from_local).
     Updates global variables `chatterbox_model`, `MODEL_LOADED`, and `model_device`.
 
     Returns:
@@ -311,7 +312,12 @@ def load_model() -> bool:
         # Get the model selector from config
         model_selector = config_manager.get_string("model.repo_id", "chatterbox-turbo")
 
+        # Check if user specified a local checkpoint path
+        local_checkpoint = config_manager.get_string("model.local_checkpoint", "")
+
         logger.info(f"Model selector from config: '{model_selector}'")
+        if local_checkpoint:
+            logger.info(f"Local checkpoint path from config: '{local_checkpoint}'")
 
         try:
             # Determine which model class to use
@@ -326,8 +332,53 @@ def load_model() -> bool:
                     f"Turbo model supports paralinguistic tags: {TURBO_PARALINGUISTIC_TAGS}"
                 )
 
-            # Load the model using from_pretrained - handles HuggingFace downloads automatically
-            chatterbox_model = model_class.from_pretrained(device=model_device)
+            # Load the model - check if loading from local checkpoint or from HuggingFace
+            if local_checkpoint and Path(local_checkpoint).exists():
+                checkpoint_path = Path(local_checkpoint)
+
+                # Check if this is a full model directory or just fine-tuned weights
+                has_full_model = (checkpoint_path / "ve.safetensors").exists()
+                has_finetuned_weights = (checkpoint_path / "model.safetensors").exists()
+
+                if has_full_model:
+                    # Full model directory - load directly
+                    logger.info(f"Loading complete model from local checkpoint: {local_checkpoint}")
+                    chatterbox_model = model_class.from_local(
+                        ckpt_dir=local_checkpoint,
+                        device=model_device
+                    )
+                elif has_finetuned_weights:
+                    # Only fine-tuned weights - load base model and replace T3 weights
+                    logger.info(f"Loading base model from HuggingFace and applying fine-tuned weights from: {local_checkpoint}")
+                    chatterbox_model = model_class.from_pretrained(device=model_device)
+
+                    # Load the fine-tuned T3 weights
+                    finetuned_weights_path = checkpoint_path / "model.safetensors"
+                    logger.info(f"Loading fine-tuned T3 weights from: {finetuned_weights_path}")
+                    finetuned_state_dict = load_file(str(finetuned_weights_path))
+
+                    # Load the weights into the T3 model
+                    chatterbox_model.t3.load_state_dict(finetuned_state_dict, strict=False)
+                    logger.info("Successfully loaded fine-tuned T3 weights into base model")
+
+                    # Move model to the correct device if needed
+                    if model_device != "cpu":
+                        chatterbox_model.t3 = chatterbox_model.t3.to(model_device)
+                else:
+                    logger.warning(
+                        f"Local checkpoint path '{local_checkpoint}' exists but doesn't contain "
+                        f"recognizable model files (ve.safetensors or model.safetensors). "
+                        f"Falling back to loading from HuggingFace Hub."
+                    )
+                    chatterbox_model = model_class.from_pretrained(device=model_device)
+            else:
+                if local_checkpoint:
+                    logger.warning(
+                        f"Local checkpoint path '{local_checkpoint}' does not exist. "
+                        f"Falling back to loading from HuggingFace Hub."
+                    )
+                # Load the model using from_pretrained - handles HuggingFace downloads automatically
+                chatterbox_model = model_class.from_pretrained(device=model_device)
 
             # Store model metadata
             loaded_model_type = model_type
