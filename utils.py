@@ -345,7 +345,24 @@ def encode_audio(
             audio_segment.export(output_buffer, format="mp3")
 
         elif output_format == "mulaw":
-            audio_clipped = np.clip(audio_array, -1.0, 1.0)
+            # For telephony-standard MULAW, resample to 8000 Hz
+            TARGET_MULAW_RATE = 8000
+            if rate_to_write != TARGET_MULAW_RATE:
+                if LIBROSA_AVAILABLE:
+                    logger.info(
+                        f"Resampling audio from {rate_to_write}Hz to {TARGET_MULAW_RATE}Hz for MULAW telephony encoding."
+                    )
+                    audio_to_write = librosa.resample(
+                        y=audio_array, orig_sr=rate_to_write, target_sr=TARGET_MULAW_RATE
+                    )
+                    rate_to_write = TARGET_MULAW_RATE
+                else:
+                    logger.warning(
+                        f"Librosa not available. Cannot resample audio from {rate_to_write}Hz to {TARGET_MULAW_RATE}Hz for MULAW. "
+                        f"Proceeding with original sample rate."
+                    )
+
+            audio_clipped = np.clip(audio_to_write, -1.0, 1.0)
             audio_int16 = (audio_clipped * 32767).astype(np.int16)
             audio_segment = AudioSegment(
                 audio_int16.tobytes(),

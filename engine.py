@@ -348,22 +348,83 @@ def load_model() -> bool:
                         device=model_device
                     )
                 elif has_finetuned_weights:
-                    # Only fine-tuned weights - load base model and replace T3 weights
+                    # Only fine-tuned weights - load base model and replace T3 module
+                    # This handles fine-tuned models with extended vocabularies (e.g., for Arabic)
                     logger.info(f"Loading base model from HuggingFace and applying fine-tuned weights from: {local_checkpoint}")
-                    chatterbox_model = model_class.from_pretrained(device=model_device)
+                    chatterbox_model = model_class.from_pretrained(device="cpu")  # Load to CPU first
 
                     # Load the fine-tuned T3 weights
                     finetuned_weights_path = checkpoint_path / "model.safetensors"
                     logger.info(f"Loading fine-tuned T3 weights from: {finetuned_weights_path}")
                     finetuned_state_dict = load_file(str(finetuned_weights_path))
 
-                    # Load the weights into the T3 model
-                    chatterbox_model.t3.load_state_dict(finetuned_state_dict, strict=False)
-                    logger.info("Successfully loaded fine-tuned T3 weights into base model")
+                    # Detect vocabulary size from the text embedding layer
+                    # The text_emb.weight tensor has shape [vocab_size, embed_dim]
+                    vocab_size = None
+                    for key in finetuned_state_dict.keys():
+                        if 'text_emb.weight' in key:
+                            vocab_size = finetuned_state_dict[key].shape[0]
+                            logger.info(f"Detected vocabulary size from checkpoint: {vocab_size}")
+                            break
 
-                    # Move model to the correct device if needed
-                    if model_device != "cpu":
-                        chatterbox_model.t3 = chatterbox_model.t3.to(model_device)
+                    if vocab_size is not None and vocab_size != chatterbox_model.t3.hp.text_tokens_dict_size:
+                        # Extended vocabulary detected - need to create new T3 module
+                        logger.info(f"Fine-tuned model has extended vocabulary (base: {chatterbox_model.t3.hp.text_tokens_dict_size}, fine-tuned: {vocab_size})")
+                        logger.info("Creating new T3 module with extended vocabulary...")
+
+                        # Import T3 class
+                        try:
+                            from chatterbox.models.t3.t3 import T3
+                        except ImportError:
+                            logger.error("Failed to import T3 class. Cannot create extended vocabulary T3.")
+                            raise
+
+                        # Get T3 config and update vocab size
+                        t3_config = chatterbox_model.t3.hp
+                        t3_config.text_tokens_dict_size = vocab_size
+
+                        # Create new T3 with extended vocabulary
+                        new_t3 = T3(hp=t3_config)
+
+                        # Strip "t3." prefix from keys if present
+                        cleaned_state_dict = {}
+                        for key, value in finetuned_state_dict.items():
+                            if key.startswith('t3.'):
+                                cleaned_key = key[3:]  # Remove "t3." prefix
+                                cleaned_state_dict[cleaned_key] = value
+                            else:
+                                cleaned_state_dict[key] = value
+
+                        logger.info(f"Cleaned {len(finetuned_state_dict)} checkpoint keys (removed 't3.' prefix where present)")
+
+                        # Load the fine-tuned weights into the new T3
+                        new_t3.load_state_dict(cleaned_state_dict, strict=True)
+                        logger.info("Successfully loaded fine-tuned weights into new T3 module with extended vocabulary")
+
+                        # Replace the T3 module in the model
+                        chatterbox_model.t3 = new_t3
+                    else:
+                        # No vocab size change, load weights directly
+                        logger.info("Vocabulary size unchanged, loading weights into existing T3 module")
+                        chatterbox_model.t3.load_state_dict(finetuned_state_dict, strict=False)
+                        logger.info("Successfully loaded fine-tuned T3 weights into base model")
+
+                    # Load extended tokenizer if present in checkpoint directory
+                    custom_tokenizer_path = checkpoint_path / "tokenizer.json"
+                    if custom_tokenizer_path.exists():
+                        from chatterbox.models.tokenizers.tokenizer import EnTokenizer
+                        logger.info(f"Loading custom tokenizer from: {custom_tokenizer_path}")
+                        chatterbox_model.tokenizer = EnTokenizer(str(custom_tokenizer_path))
+                        logger.info(f"Custom tokenizer loaded (vocab size: {len(chatterbox_model.tokenizer.tokenizer.get_vocab())})")
+                    else:
+                        logger.warning("No custom tokenizer.json found in checkpoint directory. Using base tokenizer - this may cause issues with extended vocabularies!")
+
+                    # Move entire model to the target device
+                    logger.info(f"Moving model to device: {model_device}")
+                    chatterbox_model.t3 = chatterbox_model.t3.to(model_device)
+                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(model_device)
+                    chatterbox_model.ve = chatterbox_model.ve.to(model_device)
+                    chatterbox_model.device = model_device
                 else:
                     logger.warning(
                         f"Local checkpoint path '{local_checkpoint}' exists but doesn't contain "
