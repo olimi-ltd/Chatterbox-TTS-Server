@@ -71,9 +71,15 @@ class CustomTTSRequest(BaseModel):
     )
     chunk_size: Optional[int] = Field(
         120,  # Default target chunk size from config
-        ge=50,  # Minimum reasonable chunk size
+        ge=1,  # Minimum: 1 token for streaming, 50 chars for text-chunk
         le=500,  # Maximum reasonable chunk size
-        description="Approximate target character length for text chunks when splitting is enabled (50-500).",
+        description="For streaming: number of speech tokens per chunk (default 25). For non-streaming: approximate target character length (50-500).",
+    )
+    context_window: Optional[int] = Field(
+        None,
+        ge=0,
+        le=200,
+        description="Number of previous speech tokens to include as context when processing each streaming chunk (default 50).",
     )
 
     # Embed generation parameters directly

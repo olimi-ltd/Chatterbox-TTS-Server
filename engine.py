@@ -6,7 +6,7 @@ import logging
 import random
 import numpy as np
 import torch
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Generator
 from pathlib import Path
 from safetensors.torch import load_file
 
@@ -561,6 +561,51 @@ def synthesize(
     except Exception as e:
         logger.error(f"Error during TTS synthesis: {e}", exc_info=True)
         return None, None
+
+
+def synthesize_stream(
+    text: str,
+    audio_prompt_path: Optional[str] = None,
+    temperature: float = 0.8,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+    seed: int = 0,
+    chunk_size: int = 25,
+    context_window: int = 50,
+) -> Generator[Tuple[torch.Tensor, int], None, None]:
+    """
+    Token-level streaming synthesis. Yields (audio_chunk_tensor, sample_rate) tuples
+    as speech tokens are generated.
+    """
+    global chatterbox_model
+
+    if not MODEL_LOADED or chatterbox_model is None:
+        logger.error("TTS model is not loaded. Cannot stream audio.")
+        return
+
+    if seed != 0:
+        logger.info(f"Applying seed for streaming generation: {seed}")
+        set_seed(seed)
+
+    logger.debug(
+        f"Streaming synthesis: audio_prompt='{audio_prompt_path}', temp={temperature}, "
+        f"exag={exaggeration}, cfg_weight={cfg_weight}, chunk_size={chunk_size}, "
+        f"context_window={context_window}"
+    )
+
+    try:
+        for audio_chunk, metrics in chatterbox_model.generate_stream(
+            text=text,
+            audio_prompt_path=audio_prompt_path,
+            temperature=temperature,
+            exaggeration=exaggeration,
+            cfg_weight=cfg_weight,
+            chunk_size=chunk_size,
+            context_window=context_window,
+        ):
+            yield audio_chunk, chatterbox_model.sr
+    except Exception as e:
+        logger.error(f"Error during streaming synthesis: {e}", exc_info=True)
 
 
 def reload_model() -> bool:

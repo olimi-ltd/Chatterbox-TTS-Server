@@ -3,11 +3,13 @@
 # Handles API requests for text-to-speech generation, UI serving,
 # configuration management, and file uploads.
 
+import asyncio
 import os
 import io
 import logging
 import logging.handlers  # For RotatingFileHandler
 import shutil
+import struct
 import time
 import uuid
 import yaml  # For loading presets
@@ -249,6 +251,47 @@ templates = Jinja2Templates(directory=str(ui_static_path))
 
 # --- Audio Stitching Helper Functions ---
 # These functions support smart audio chunk concatenation with crossfading
+
+
+def _create_wav_header(
+    sample_rate: int, channels: int = 1, bits_per_sample: int = 16
+) -> bytes:
+    """Create a WAV header for streaming (unknown final size)."""
+    byte_rate = sample_rate * channels * (bits_per_sample // 8)
+    block_align = channels * (bits_per_sample // 8)
+    max_32bit_int = 0xFFFFFFFF
+    riff_chunk_size = max_32bit_int
+    data_size = riff_chunk_size - 36
+    header = b"RIFF"
+    header += struct.pack("<I", riff_chunk_size)
+    header += b"WAVEfmt "
+    header += struct.pack("<I", 16)
+    header += struct.pack("<H", 1)
+    header += struct.pack("<H", channels)
+    header += struct.pack("<I", sample_rate)
+    header += struct.pack("<I", byte_rate)
+    header += struct.pack("<H", block_align)
+    header += struct.pack("<H", bits_per_sample)
+    header += b"data"
+    header += struct.pack("<I", data_size)
+    return header
+
+
+def _float32_to_pcm16(audio: np.ndarray) -> bytes:
+    """Convert float32 audio (-1.0 to 1.0) to PCM16 bytes."""
+    audio = np.clip(audio, -1.0, 1.0)
+    audio_int16 = (audio * 32767).astype(np.int16)
+    return audio_int16.tobytes()
+
+
+def _float32_to_mulaw(audio: np.ndarray, orig_sr: int, target_sr: int = 8000) -> bytes:
+    """Convert float32 audio to mu-law encoded bytes, resampled to target_sr."""
+    audio = np.clip(audio, -1.0, 1.0)
+    if orig_sr != target_sr:
+        audio = librosa.resample(y=audio, orig_sr=orig_sr, target_sr=target_sr)
+    audio_int16 = (audio * 32767).astype(np.int16)
+    import audioop
+    return audioop.lin2ulaw(audio_int16.tobytes(), 2)
 
 
 def _generate_equal_power_curves(n_samples: int):
@@ -1221,6 +1264,113 @@ async def custom_tts_endpoint(
 
     return StreamingResponse(
         io.BytesIO(encoded_audio_bytes), media_type=media_type, headers=headers
+    )
+
+
+# --- Streaming TTS Endpoint ---
+
+
+async def stream_tts_generator(
+    request: CustomTTSRequest,
+    audio_prompt_path: str = None,
+    target_sample_rate: int = 24000,
+):
+    """Async generator that yields audio chunks using token-level streaming.
+    Uses asyncio.Queue + thread pattern to bridge sync generator with async response.
+    Supports WAV (PCM16) and raw MULAW (8kHz) output formats."""
+
+    output_format = request.output_format or "wav"
+    is_mulaw = output_format == "mulaw"
+
+    # Emit WAV header first for WAV format
+    if not is_mulaw:
+        yield _create_wav_header(target_sample_rate)
+
+    def _encode_chunk(audio: np.ndarray, sr: int) -> bytes:
+        if is_mulaw:
+            return _float32_to_mulaw(audio, orig_sr=sr)
+        return _float32_to_pcm16(audio)
+
+    # Token-level streaming parameters
+    chunk_size = request.chunk_size if request.chunk_size and request.chunk_size <= 100 else 25
+    context_window = request.context_window if request.context_window is not None else 50
+    seed = request.seed if request.seed is not None else get_gen_default_seed()
+
+    queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _run_stream():
+        """Run the synchronous streaming generator in a thread, pushing chunks to the queue."""
+        try:
+            for audio_chunk_tensor, sr in engine.synthesize_stream(
+                text=request.text,
+                audio_prompt_path=audio_prompt_path,
+                temperature=request.temperature or get_gen_default_temperature(),
+                exaggeration=request.exaggeration or get_gen_default_exaggeration(),
+                cfg_weight=request.cfg_weight or get_gen_default_cfg_weight(),
+                seed=seed,
+                chunk_size=chunk_size,
+                context_window=context_window,
+            ):
+                if audio_chunk_tensor is not None:
+                    audio_np = audio_chunk_tensor.cpu().numpy().squeeze().astype(np.float32)
+
+                    # Apply speed factor if needed
+                    speed = request.speed_factor or get_gen_default_speed_factor()
+                    if speed != 1.0:
+                        audio_chunk_tensor_speed, _ = utils.apply_speed_factor(
+                            audio_chunk_tensor, sr, speed
+                        )
+                        audio_np = audio_chunk_tensor_speed.cpu().numpy().squeeze().astype(np.float32)
+
+                    encoded = _encode_chunk(audio_np, sr)
+                    loop.call_soon_threadsafe(queue.put_nowait, encoded)
+        except Exception as e:
+            logger.error(f"Streaming thread error: {e}", exc_info=True)
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, None)  # Sentinel
+
+    # Start the streaming thread
+    stream_thread = threading.Thread(target=_run_stream, daemon=True)
+    stream_thread.start()
+
+    # Yield chunks as they arrive from the queue
+    while True:
+        chunk = await queue.get()
+        if chunk is None:
+            break
+        yield chunk
+
+
+@app.post("/tts/stream", tags=["TTS Generation"])
+async def tts_stream_endpoint(request: CustomTTSRequest):
+    """Stream TTS audio as WAV chunks during generation for reduced time-to-first-sound."""
+    logger.info(f"Stream request received for: {request.text[:30]}...")
+    audio_prompt_path_str = None
+    if request.voice_mode == "predefined" and request.predefined_voice_id:
+        p = (
+            get_predefined_voices_path(ensure_absolute=True)
+            / request.predefined_voice_id
+        )
+        if p.exists():
+            audio_prompt_path_str = str(p)
+    elif request.voice_mode == "clone" and request.reference_audio_filename:
+        p = (
+            get_reference_audio_path(ensure_absolute=True)
+            / request.reference_audio_filename
+        )
+        if p.exists():
+            audio_prompt_path_str = str(p)
+
+    if not engine.MODEL_LOADED:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    target_sr = get_audio_sample_rate()
+    output_format = request.output_format or "wav"
+    media_type = "audio/x-mulaw" if output_format == "mulaw" else "audio/wav"
+    return StreamingResponse(
+        stream_tts_generator(request, audio_prompt_path_str, target_sr),
+        media_type=media_type,
     )
 
 
