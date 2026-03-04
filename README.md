@@ -32,6 +32,15 @@ This server is based on the architecture and UI of our [Dia-TTS-Server](https://
 
 ## 🆕 What's New
 
+### 🔊 Token-Level Streaming (new)
+
+- Added **token-level streaming** to the `/tts/stream` endpoint for dramatically reduced time-to-first-audio.
+- Achieves **~0.9s latency to first audio chunk** (warm) vs ~3s+ with the previous text-chunk approach.
+- Audio is generated and streamed incrementally as the model produces speech tokens — no need to wait for full synthesis.
+- Supports both **WAV** (PCM16, 24kHz) and **MULAW** (8kHz) output formats for direct telephony integration.
+- Configurable `chunk_size` and `context_window` parameters to balance latency vs audio quality.
+- See [`docs/streaming-api.md`](docs/streaming-api.md) for full integration guide with Python, Node.js, and Twilio examples.
+
 ### 📦 Portable Mode for Windows (new)
 
 - The launcher now offers **Portable Mode** for all Windows users during first-time setup — selected by default.
@@ -185,6 +194,7 @@ This server application enhances the underlying `chatterbox-tts` engine with the
     *   🔁 **Hot-Swappable Engines:** Switch between Original Chatterbox, Chatterbox Multilingual, and Chatterbox‑Turbo directly in the Web UI—no restarts required.
     *   🌍 **Multilingual Support:** 23 languages including Arabic, Chinese, French, German, Japanese, Spanish, and more via Chatterbox Multilingual.
     *   🎭 **Paralinguistic Tags (Turbo):** Native support for `[laugh]`, `[cough]`, `[chuckle]` and other expressive tags.
+    *   🔊 **Token-Level Streaming:** `/tts/stream` endpoint streams audio chunks as speech tokens are generated (~0.9s to first audio). Supports WAV and MULAW formats for telephony integration.
     *   📚 **Large Text Handling:** Intelligently splits long plain text inputs into chunks based on sentences, generates audio for each, and concatenates the results seamlessly. Configurable via `split_text` and `chunk_size`.
     *   📖 **Audiobook Creation:** Perfect for generating complete audiobooks from full-length texts with consistent voice quality and automatic chapter handling.
     *   🎤 **Predefined Voices:** Select from curated synthetic voices in the `./voices` directory.
@@ -972,17 +982,26 @@ The primary endpoint for TTS generation is `/tts`, which offers detailed control
         *   `voice_mode` (string, "predefined" or "clone", default "predefined"): Specifies voice source.
         *   `predefined_voice_id` (string, optional): Filename of predefined voice (if `voice_mode` is "predefined").
         *   `reference_audio_filename` (string, optional): Filename of reference audio (if `voice_mode` is "clone").
-        *   `output_format` (string, "wav" or "opus", default "wav").
+        *   `output_format` (string, "wav", "opus", "mp3", or "mulaw", default "wav").
         *   `split_text` (boolean, default True): Whether to chunk long text.
         *   `chunk_size` (integer, default 120): Target characters per chunk.
         *   `temperature`, `exaggeration`, `cfg_weight`, `seed`, `speed_factor`, `language`: Generation parameters overriding defaults.
-    *   **Response:** Streaming audio (`audio/wav` or `audio/opus`).
+    *   **Response:** Audio file (`audio/wav`, `audio/opus`, `audio/mpeg`, or `audio/x-mulaw`).
+
+*   **`/tts/stream` (POST):** Token-level streaming endpoint for low-latency audio generation (~0.9s to first audio chunk).
+    *   **Request Body:** Same as `/tts`, plus:
+        *   `chunk_size` (integer, default 25): Number of speech tokens per streaming chunk (1-100). Lower = faster first chunk.
+        *   `context_window` (integer, default 50): Previous tokens included as decode context per chunk (0-200). Higher = smoother audio boundaries.
+    *   **Response:** Streaming audio (`audio/wav` PCM16 at 24kHz, or `audio/x-mulaw` raw bytes at 8kHz).
+    *   **Best for:** Real-time playback, telephony/IVR systems, conversational AI, and any use case where low latency matters.
+    *   See [`docs/streaming-api.md`](docs/streaming-api.md) for full integration guide with code examples (Python, Node.js, Twilio, browser).
+
 *   **`/v1/audio/speech` (POST):** OpenAI-compatible.
     *   `input`: Text.
     *   `voice`: 'S1', 'S2', 'dialogue', 'predefined_voice_filename.wav', or 'reference_filename.wav'.
-    *   `response_format`: 'opus' or 'wav'.
+    *   `response_format`: 'opus', 'wav', 'mp3', or 'mulaw'.
     *   `speed`: Playback speed factor (0.5-2.0).
-    *   `seed`: (Optional) Integer seed, -1 for random.    
+    *   `seed`: (Optional) Integer seed, -1 for random.
 *   **Helper Endpoints (mostly for UI):**
     *   `GET /api/ui/initial-data`: Fetches all initial configuration, file lists, and presets for the UI.
     *   `POST /save_settings`: Saves partial updates to `config.yaml`.
