@@ -74,7 +74,7 @@ class OpenAISpeechRequest(BaseModel):
     model: str
     input_: str = Field(..., alias="input")
     voice: str
-    response_format: Literal["wav", "opus", "mp3"] = "wav"  # Add "mp3"
+    response_format: Literal["wav", "opus", "mp3", "mulaw"] = "wav"
     speed: float = 1.0
     seed: Optional[int] = None
 
@@ -1181,7 +1181,7 @@ async def custom_tts_endpoint(
             detail=f"Failed to encode audio to {output_format_str} or generated invalid audio.",
         )
 
-    media_type = f"audio/{output_format_str}"
+    media_type = "audio/x-mulaw" if output_format_str == "mulaw" else f"audio/{output_format_str}"
     timestamp_str = time.strftime("%Y%m%d_%H%M%S")
     suggested_filename_base = f"tts_output_{timestamp_str}"
     download_filename = utils.sanitize_filename(
@@ -1293,7 +1293,7 @@ async def openai_speech_endpoint(request: OpenAISpeechRequest):
             raise HTTPException(status_code=500, detail="Failed to encode audio.")
 
         # Determine the media type
-        media_type = f"audio/{request.response_format}"
+        media_type = "audio/x-mulaw" if request.response_format == "mulaw" else f"audio/{request.response_format}"
 
         # Optional: Save to disk if enabled
         if config_manager.get_bool("audio_output.save_to_disk", False):
