@@ -10,10 +10,19 @@ from typing import Optional, Tuple, Generator
 from pathlib import Path
 from safetensors.torch import load_file
 
-from chatterbox.tts import ChatterboxTTS  # Main TTS engine class
+import torch.nn.functional as F
+from chatterbox.tts import ChatterboxTTS, punc_norm
 from chatterbox.models.s3gen.const import (
     S3GEN_SR,
 )  # Default sample rate from the engine
+from chatterbox.models.s3tokenizer import drop_invalid_tokens
+from chatterbox.models.t3.modules.cond_enc import T3Cond
+from chatterbox.models.t3.inference.t3_hf_backend import T3HuggingfaceBackend
+from transformers.generation.logits_process import (
+    TopPLogitsWarper,
+    MinPLogitsWarper,
+    RepetitionPenaltyLogitsProcessor,
+)
 
 # Defensive Turbo import - Turbo may not be available in older package versions
 try:
@@ -563,6 +572,199 @@ def synthesize(
         return None, None
 
 
+# ---------------------------------------------------------------------------
+# Token-level streaming helpers
+# ---------------------------------------------------------------------------
+
+def _decode_chunk(
+    model,
+    chunk_tokens: torch.Tensor,
+    all_tokens: torch.Tensor,
+    context_window: int,
+    device,
+) -> Optional[torch.Tensor]:
+    """
+    Decode a chunk of speech tokens to audio using S3Gen.
+
+    Prepends up to context_window preceding tokens for continuity, trims
+    the corresponding audio using a dynamic samples-per-token ratio, applies
+    a 20 ms linear fade-in to smooth boundaries, and watermarks the result.
+    Returns a (1, samples) float32 tensor, or None if output is empty.
+    """
+    FADE_SAMPLES = int(0.02 * S3GEN_SR)  # 20 ms at 24 kHz
+
+    if all_tokens.numel() > 0:
+        ctx = all_tokens[-context_window:] if all_tokens.numel() > context_window else all_tokens
+        tokens_to_decode = torch.cat([ctx, chunk_tokens])
+        context_length = ctx.numel()
+    else:
+        tokens_to_decode = chunk_tokens
+        context_length = 0
+
+    clean = drop_invalid_tokens(tokens_to_decode.to(device))
+    if clean.numel() == 0:
+        return None
+
+    wav, _ = model.s3gen.inference(speech_tokens=clean, ref_dict=model.conds.gen)
+    wav_np = wav.squeeze(0).detach().cpu().numpy()
+
+    # Trim context using dynamic ratio (avoids hard-coded hop-size assumption)
+    if context_length > 0:
+        samples_per_token = len(wav_np) / len(clean)
+        wav_np = wav_np[int(context_length * samples_per_token):]
+
+    if len(wav_np) == 0:
+        return None
+
+    # Short linear fade-in to smooth chunk boundaries
+    fade = min(FADE_SAMPLES, len(wav_np))
+    if fade > 0:
+        wav_np[:fade] *= np.linspace(0.0, 1.0, fade, dtype=wav_np.dtype)
+
+    # Watermark each chunk (matches non-streaming generate() behaviour)
+    wav_np = model.watermarker.apply_watermark(wav_np, sample_rate=model.sr)
+
+    return torch.from_numpy(wav_np).unsqueeze(0)  # (1, samples)
+
+
+def _stream_generate(
+    model,
+    text: str,
+    audio_prompt_path: Optional[str] = None,
+    temperature: float = 0.8,
+    exaggeration: float = 0.5,
+    cfg_weight: float = 0.5,
+    chunk_size: int = 25,
+    context_window: int = 50,
+    max_new_tokens: int = 1000,
+    repetition_penalty: float = 1.2,
+    min_p: float = 0.05,
+    top_p: float = 0.95,
+) -> Generator[Tuple[torch.Tensor, int], None, None]:
+    """
+    Token-level streaming generator. Replicates the T3 KV-cache loop from
+    ChatterboxTTS.generate() but yields decoded audio as tokens are produced.
+    """
+    # --- Conditionals ---
+    if audio_prompt_path:
+        model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+    else:
+        if model.conds is None:
+            raise RuntimeError("No conditionals loaded. Provide audio_prompt_path or call prepare_conditionals first.")
+        if exaggeration != model.conds.t3.emotion_adv[0, 0, 0].item():
+            _cond = model.conds.t3
+            model.conds.t3 = T3Cond(
+                speaker_emb=_cond.speaker_emb,
+                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+            ).to(device=model.device)
+
+    # --- Tokenize (always duplicate for CFG batch) ---
+    text = punc_norm(text)
+    text_tokens = model.tokenizer.text_to_tokens(text).to(model.device)
+    text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # batch=2 for CFG
+    sot = model.t3.hp.start_text_token
+    eot = model.t3.hp.stop_text_token
+    text_tokens = F.pad(text_tokens, (1, 0), value=sot)
+    text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+
+    t3 = model.t3
+
+    with torch.inference_mode():
+        patched_model = T3HuggingfaceBackend(
+            config=t3.cfg,
+            llama=t3.tfmr,
+            speech_enc=t3.speech_emb,
+            speech_head=t3.speech_head,
+            alignment_stream_analyzer=None,
+        )
+
+        initial_speech = t3.hp.start_speech_token * torch.ones_like(text_tokens[:, :1])
+        embeds, _ = t3.prepare_input_embeds(
+            t3_cond=model.conds.t3,
+            text_tokens=text_tokens,
+            speech_tokens=initial_speech,
+            cfg_weight=cfg_weight,
+        )
+
+        device = embeds.device
+
+        bos_token = torch.tensor([[t3.hp.start_speech_token]], dtype=torch.long, device=device)
+        bos_embed = t3.speech_emb(bos_token) + t3.speech_pos_emb.get_fixed_embedding(0)
+        bos_embed = torch.cat([bos_embed, bos_embed])
+        inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
+
+        generated_ids = bos_token.clone()
+
+        top_p_proc     = TopPLogitsWarper(top_p=top_p)
+        min_p_proc     = MinPLogitsWarper(min_p=min_p)
+        rep_penalty_proc = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
+
+        output = patched_model(
+            inputs_embeds=inputs_embeds,
+            past_key_values=None,
+            use_cache=True,
+            output_attentions=True,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        past = output.past_key_values
+
+        # 1-D token accumulators for efficient slicing
+        all_tokens = torch.empty(0, dtype=torch.long, device=device)
+        chunk_buf   = torch.empty(0, dtype=torch.long, device=device)
+
+        for i in range(max_new_tokens):
+            logits_step = output.logits[:, -1, :]
+            cond   = logits_step[0:1, :]
+            uncond = logits_step[1:2, :]
+            logits = cond + cfg_weight * (cond - uncond)
+
+            ids_for_proc = generated_ids[:1, ...]
+            if temperature != 1.0:
+                logits = logits / temperature
+            logits = rep_penalty_proc(ids_for_proc, logits)
+            logits = min_p_proc(ids_for_proc, logits)
+            logits = top_p_proc(ids_for_proc, logits)
+
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            generated_ids = torch.cat([generated_ids, next_token], dim=1)
+
+            # EOS: flush remaining buffer and stop
+            if next_token.view(-1).item() == t3.hp.stop_speech_token:
+                if chunk_buf.numel() > 0:
+                    ctx_tokens = all_tokens[: all_tokens.numel() - chunk_buf.numel()]
+                    audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
+                    if audio is not None:
+                        yield audio, model.sr
+                break
+
+            token_val  = next_token.view(-1)
+            chunk_buf  = torch.cat([chunk_buf,  token_val])
+            all_tokens = torch.cat([all_tokens, token_val])
+
+            # Yield when chunk buffer is full
+            if chunk_buf.numel() >= chunk_size:
+                ctx_tokens = all_tokens[: all_tokens.numel() - chunk_buf.numel()]
+                audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
+                if audio is not None:
+                    yield audio, model.sr
+                chunk_buf = torch.empty(0, dtype=torch.long, device=device)
+
+            # Advance KV-cache
+            next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)
+            next_embed = torch.cat([next_embed, next_embed])
+            output = patched_model(
+                inputs_embeds=next_embed,
+                past_key_values=past,
+                output_attentions=True,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            past = output.past_key_values
+
+
 def synthesize_stream(
     text: str,
     audio_prompt_path: Optional[str] = None,
@@ -594,7 +796,8 @@ def synthesize_stream(
     )
 
     try:
-        for audio_chunk, metrics in chatterbox_model.generate_stream(
+        yield from _stream_generate(
+            model=chatterbox_model,
             text=text,
             audio_prompt_path=audio_prompt_path,
             temperature=temperature,
@@ -602,8 +805,7 @@ def synthesize_stream(
             cfg_weight=cfg_weight,
             chunk_size=chunk_size,
             context_window=context_window,
-        ):
-            yield audio_chunk, chatterbox_model.sr
+        )
     except Exception as e:
         logger.error(f"Error during streaming synthesis: {e}", exc_info=True)
 
