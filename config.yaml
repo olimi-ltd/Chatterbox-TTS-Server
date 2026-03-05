@@ -10,7 +10,7 @@ server:
   log_file_backup_count: 5
 model:
   repo_id: chatterbox
-  local_checkpoint: /home/incode/Chatterbox/chatterbox-finetuning/chatterbox_egyptian_AliAndOmar/checkpoint-6000
+  local_checkpoint: ./model/checkpoint-63000
 tts_engine:
   device: cuda
   predefined_voices_path: voices
