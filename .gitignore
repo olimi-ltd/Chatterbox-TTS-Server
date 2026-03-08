@@ -46,4 +46,4 @@ htmlcov/
 # Ignore log files
 *.log
 
-model/
+models/

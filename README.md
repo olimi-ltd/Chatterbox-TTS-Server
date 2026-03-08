@@ -1274,7 +1274,7 @@ python server.py
 
 *   **Main config:** The server uses `config.yaml` for settings. The docker-compose files mount your local `config.yaml` to `/app/config.yaml` inside the container.
 *   **First run:** If `config.yaml` doesn't exist locally, the application will create a default one with sensible defaults.
-*   **Editing config:** You can edit the local `config.yaml` directly. Changes to server/model/path settings require a container restart:
+*   **Editing config:** You can edit the local `config.yaml` directly. Changes to server/models/path settings require a container restart:
     ```bash
     docker compose restart chatterbox-tts-server
     ```
