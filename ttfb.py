@@ -9,7 +9,7 @@ PORT = os.environ.get("SERVER_PORT", "8004")
 URL = f"http://localhost:{PORT}/stream/audio/speech"
 OUTPUT_FILE = "outputs/output_stream.mulaw"
 PAYLOAD = {
-    "input": "صباح الخير",
+    "input": "ألو مين معايا؟",
     "voice_id": "Dina-ref",
     "output_format": "mulaw",
     "chunk_size": 25,

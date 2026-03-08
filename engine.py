@@ -1,6 +1,7 @@
 # File: engine.py
 # Core TTS model loading and speech generation logic.
 
+import concurrent.futures
 import gc
 import logging
 import random
@@ -667,15 +668,11 @@ def _stream_generate(
     Token-level streaming generator. Replicates the T3 KV-cache loop from
     ChatterboxTTS.generate() but yields decoded audio as tokens are produced.
     """
-    import time as _time
-
     # --- Conditionals (with caching) ---
-    _t0 = _time.perf_counter()
     if audio_prompt_path:
         _cached = _conditionals_cache.get(audio_prompt_path)
         if _cached is not None:
             model.conds = _cached
-            logger.debug(f"Using cached conditionals for: {audio_prompt_path}")
         else:
             model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
             # Cache a deep copy of the conditionals
@@ -687,7 +684,6 @@ def _stream_generate(
                 ),
                 {k: v.clone() if torch.is_tensor(v) else v for k, v in model.conds.gen.items()},
             )
-            logger.info(f"Cached conditionals for: {audio_prompt_path}")
     else:
         if model.conds is None:
             raise RuntimeError("No conditionals loaded. Provide audio_prompt_path or call prepare_conditionals first.")
@@ -700,8 +696,6 @@ def _stream_generate(
             cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
         ).to(device=model.device)
-    _t1 = _time.perf_counter()
-    logger.info(f"[stream-perf] conditionals: {(_t1-_t0)*1000:.1f}ms")
 
     # --- Tokenize (always duplicate for CFG batch) ---
     text = punc_norm(text)
@@ -745,9 +739,6 @@ def _stream_generate(
         min_p_proc     = MinPLogitsWarper(min_p=min_p)
         rep_penalty_proc = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
 
-        _t2 = _time.perf_counter()
-        logger.info(f"[stream-perf] prepare_embeds: {(_t2-_t1)*1000:.1f}ms")
-
         output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
@@ -757,14 +748,15 @@ def _stream_generate(
             return_dict=True,
         )
         past = output.past_key_values
-        torch.cuda.synchronize()
-        _t3 = _time.perf_counter()
-        logger.info(f"[stream-perf] prefill: {(_t3-_t2)*1000:.1f}ms")
 
         # 1-D token accumulators for efficient slicing
         all_tokens = torch.empty(0, dtype=torch.long, device=device)
         chunk_buf   = torch.empty(0, dtype=torch.long, device=device)
         _first_chunk = True
+
+        # Pipeline: decode audio in background while generating next tokens
+        _pending_decode: Optional[concurrent.futures.Future] = None
+        _decode_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
         for i in range(max_new_tokens):
             logits_step = output.logits[:, -1, :]
@@ -785,6 +777,12 @@ def _stream_generate(
 
             # EOS: flush remaining buffer and stop
             if next_token.view(-1).item() == t3.hp.stop_speech_token:
+                # Wait for any pending decode first
+                if _pending_decode is not None:
+                    audio = _pending_decode.result()
+                    if audio is not None:
+                        yield audio, model.sr
+                    _pending_decode = None
                 if chunk_buf.numel() > 0:
                     ctx_tokens = all_tokens[: all_tokens.numel() - chunk_buf.numel()]
                     audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
@@ -800,19 +798,30 @@ def _stream_generate(
             _current_chunk_size = min(8, chunk_size) if _first_chunk else chunk_size
             # Yield when chunk buffer is full
             if chunk_buf.numel() >= _current_chunk_size:
-                torch.cuda.synchronize()
-                _t4 = _time.perf_counter()
-                logger.info(f"[stream-perf] {chunk_buf.numel()} tokens generated: {(_t4-_t3)*1000:.1f}ms")
+                # Yield any previously completed decode result
+                if _pending_decode is not None:
+                    audio = _pending_decode.result()
+                    if audio is not None:
+                        yield audio, model.sr
+                    _pending_decode = None
+
                 ctx_tokens = all_tokens[: all_tokens.numel() - chunk_buf.numel()]
-                audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
-                torch.cuda.synchronize()
-                _t5 = _time.perf_counter()
-                logger.info(f"[stream-perf] s3gen decode: {(_t5-_t4)*1000:.1f}ms")
-                if audio is not None:
-                    yield audio, model.sr
+
+                if _first_chunk:
+                    # First chunk: decode synchronously for lowest TTFB
+                    audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
+                    if audio is not None:
+                        yield audio, model.sr
+                else:
+                    # Subsequent chunks: decode in background while generating next tokens
+                    _chunk_tokens_copy = chunk_buf.clone()
+                    _ctx_tokens_copy = ctx_tokens.clone()
+                    _pending_decode = _decode_executor.submit(
+                        _decode_chunk, model, _chunk_tokens_copy, _ctx_tokens_copy, context_window, device
+                    )
+
                 chunk_buf = torch.empty(0, dtype=torch.long, device=device)
                 _first_chunk = False
-                _t3 = _time.perf_counter()
 
             # Advance KV-cache
             next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)
@@ -825,6 +834,13 @@ def _stream_generate(
                 return_dict=True,
             )
             past = output.past_key_values
+
+        # Handle any pending decode if loop ended without EOS
+        if _pending_decode is not None:
+            audio = _pending_decode.result()
+            if audio is not None:
+                yield audio, model.sr
+        _decode_executor.shutdown(wait=False)
 
 
 def synthesize_stream(
