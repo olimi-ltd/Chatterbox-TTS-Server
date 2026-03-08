@@ -17,7 +17,7 @@ dependencies = [
     "uvicorn[standard]",
 
     # Scientific Computing & ML
-    "numpy>=1.24.0,<1.26.0",
+    "numpy>=1.24.0",
     "librosa",
     "safetensors",
 
