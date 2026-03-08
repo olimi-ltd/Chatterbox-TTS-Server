@@ -64,6 +64,7 @@ from config import (
 import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
+    StreamTTSRequest,
     ErrorResponse,
     UpdateStatusResponse,
 )
@@ -1271,15 +1272,15 @@ async def custom_tts_endpoint(
 
 
 async def stream_tts_generator(
-    request: CustomTTSRequest,
-    audio_prompt_path: str = None,
+    request: StreamTTSRequest,
+    audio_prompt_path: Optional[str] = None,
     target_sample_rate: int = 24000,
 ):
     """Async generator that yields audio chunks using token-level streaming.
     Uses asyncio.Queue + thread pattern to bridge sync generator with async response.
     Supports WAV (PCM16) and raw MULAW (8kHz) output formats."""
 
-    output_format = request.output_format or "wav"
+    output_format = request.output_format or "mulaw"
     is_mulaw = output_format == "mulaw"
 
     # Emit WAV header first for WAV format
@@ -1303,7 +1304,7 @@ async def stream_tts_generator(
         """Run the synchronous streaming generator in a thread, pushing chunks to the queue."""
         try:
             for audio_chunk_tensor, sr in engine.synthesize_stream(
-                text=request.text,
+                text=request.input,
                 audio_prompt_path=audio_prompt_path,
                 temperature=request.temperature or get_gen_default_temperature(),
                 exaggeration=request.exaggeration or get_gen_default_exaggeration(),
@@ -1342,31 +1343,27 @@ async def stream_tts_generator(
         yield chunk
 
 
-@app.post("/tts/stream", tags=["TTS Generation"])
-async def tts_stream_endpoint(request: CustomTTSRequest):
+@app.post("/stream/audio/speech", tags=["TTS Generation"])
+async def tts_stream_endpoint(request: StreamTTSRequest):
     """Stream TTS audio as WAV chunks during generation for reduced time-to-first-sound."""
-    logger.info(f"Stream request received for: {request.text[:30]}...")
+    logger.info(f"Stream request received for: {request.input[:30]}...")
     audio_prompt_path_str = None
-    if request.voice_mode == "predefined" and request.predefined_voice_id:
-        p = (
-            get_predefined_voices_path(ensure_absolute=True)
-            / request.predefined_voice_id
-        )
+    if request.voice_id:
+        # Look for voice file in predefined voices directory (append .wav like chatterbox-streaming)
+        p = get_predefined_voices_path(ensure_absolute=True) / (request.voice_id + ".wav")
         if p.exists():
             audio_prompt_path_str = str(p)
-    elif request.voice_mode == "clone" and request.reference_audio_filename:
-        p = (
-            get_reference_audio_path(ensure_absolute=True)
-            / request.reference_audio_filename
-        )
-        if p.exists():
-            audio_prompt_path_str = str(p)
+        else:
+            # Also check reference audio directory
+            p = get_reference_audio_path(ensure_absolute=True) / (request.voice_id + ".wav")
+            if p.exists():
+                audio_prompt_path_str = str(p)
 
     if not engine.MODEL_LOADED:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    target_sr = get_audio_sample_rate()
-    output_format = request.output_format or "wav"
+    target_sr = request.output_sample_rate or get_audio_sample_rate()
+    output_format = request.output_format or "mulaw"
     media_type = "audio/x-mulaw" if output_format == "mulaw" else "audio/wav"
     return StreamingResponse(
         stream_tts_generator(request, audio_prompt_path_str, target_sr),

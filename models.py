@@ -101,6 +101,47 @@ class CustomTTSRequest(BaseModel):
     )
 
 
+class StreamTTSRequest(BaseModel):
+    """Request model for the /stream/audio/speech endpoint.
+    Compatible with chatterbox-streaming server field names."""
+
+    input: str = Field(..., min_length=1, description="Text to be synthesized.")
+    voice_id: Optional[str] = Field(
+        None, description="Voice file identifier (without extension)."
+    )
+    language_id: Optional[str] = Field(
+        "ar", description="Language identifier for synthesis."
+    )
+    cfg_weight: Optional[float] = Field(
+        None, description="Classifier-Free Guidance weight."
+    )
+    exaggeration: Optional[float] = Field(
+        None, description="Exaggeration level for synthesis."
+    )
+    temperature: Optional[float] = Field(
+        None, description="Sampling temperature."
+    )
+    output_sample_rate: Optional[int] = Field(
+        None, description="Target output sample rate."
+    )
+    chunk_size: Optional[int] = Field(
+        25, ge=1, le=100, description="Number of speech tokens per chunk."
+    )
+    additional_tokens: Optional[int] = Field(
+        90, description="Additional tokens beyond estimated length."
+    )
+    context_window: Optional[int] = Field(
+        None, ge=0, le=200, description="Number of previous speech tokens for context."
+    )
+    output_format: Optional[Literal["wav", "opus", "mp3", "mulaw"]] = Field(
+        "mulaw", description="Desired audio output format."
+    )
+    seed: Optional[int] = Field(None, description="Random seed for generation.")
+    speed_factor: Optional[float] = Field(
+        None, description="Speed factor for audio playback."
+    )
+
+
 class ErrorResponse(BaseModel):
     """Standard error response model for API errors."""
 
