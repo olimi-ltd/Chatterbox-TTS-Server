@@ -1,10 +1,10 @@
 module.exports = {
   apps: [
     {
-      name: "chatterbox-tts",
+      name: "chatterbox-tts-server",
       script: ".venv/bin/python",
       args: "server.py",
-      cwd: "/home/unknown/projects/incode/chatterbox/Chatterbox-TTS-Server",
+      cwd: __dirname,
       interpreter: "none",
       env: {
         PYTHONUNBUFFERED: "1",
