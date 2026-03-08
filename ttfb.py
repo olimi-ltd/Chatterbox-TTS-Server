@@ -2,7 +2,7 @@ import time
 import requests
 
 URL = "http://localhost:8004/stream/audio/speech"
-OUTPUT_FILE = "output_stream.mulaw"
+OUTPUT_FILE = "outputs/output_stream.mulaw"
 PAYLOAD = {
     "input": "صباح الخير",
     "voice_id": "Dina-ref",
