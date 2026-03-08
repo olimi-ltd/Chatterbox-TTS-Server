@@ -6,12 +6,13 @@ import logging
 import random
 import numpy as np
 import torch
+from contextlib import nullcontext
 from typing import Optional, Tuple, Generator
 from pathlib import Path
 from safetensors.torch import load_file
 
 import torch.nn.functional as F
-from chatterbox.tts import ChatterboxTTS, punc_norm
+from chatterbox.tts import ChatterboxTTS, Conditionals, punc_norm
 from chatterbox.models.s3gen.const import (
     S3GEN_SR,
 )  # Default sample rate from the engine
@@ -99,6 +100,9 @@ model_device: Optional[str] = (
 # Track which model type is loaded
 loaded_model_type: Optional[str] = None  # "original" or "turbo"
 loaded_model_class_name: Optional[str] = None  # "ChatterboxTTS" or "ChatterboxTurboTTS"
+
+# Cache for voice conditionals to avoid recomputing on every request
+_conditionals_cache: dict = {}
 
 
 def set_seed(seed_value: int):
@@ -350,13 +354,21 @@ def load_model() -> bool:
                 has_finetuned_weights = (checkpoint_path / "model.safetensors").exists()
 
                 if has_full_model:
-                    # Full model directory - load directly
+                    # Full model directory - try loading directly
                     logger.info(f"Loading complete model from local checkpoint: {local_checkpoint}")
-                    chatterbox_model = model_class.from_local(
-                        ckpt_dir=local_checkpoint,
-                        device=model_device
-                    )
-                elif has_finetuned_weights:
+                    try:
+                        chatterbox_model = model_class.from_local(
+                            ckpt_dir=local_checkpoint,
+                            device=model_device
+                        )
+                    except RuntimeError as e:
+                        if "size mismatch" in str(e) and has_finetuned_weights:
+                            logger.warning(f"Direct loading failed due to size mismatch (likely extended vocabulary). Falling back to fine-tuned loading path.")
+                            has_full_model = False  # Fall through to fine-tuned path below
+                        else:
+                            raise
+
+                if not has_full_model and has_finetuned_weights:
                     # Only fine-tuned weights - load base model and replace T3 module
                     # This handles fine-tuned models with extended vocabularies (e.g., for Arabic)
                     logger.info(f"Loading base model from HuggingFace and applying fine-tuned weights from: {local_checkpoint}")
@@ -428,13 +440,20 @@ def load_model() -> bool:
                     else:
                         logger.warning("No custom tokenizer.json found in checkpoint directory. Using base tokenizer - this may cause issues with extended vocabularies!")
 
-                    # Move entire model to the target device
+                    # Load local conds.pt if present
+                    local_conds_path = checkpoint_path / "conds.pt"
+                    if local_conds_path.exists():
+                        from chatterbox.tts import Conditionals
+                        logger.info(f"Loading conditionals from: {local_conds_path}")
+                        chatterbox_model.conds = Conditionals.load(local_conds_path, map_location=model_device).to(model_device)
+
+                    # Move entire model to the target device and set to eval mode
                     logger.info(f"Moving model to device: {model_device}")
-                    chatterbox_model.t3 = chatterbox_model.t3.to(model_device)
-                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(model_device)
-                    chatterbox_model.ve = chatterbox_model.ve.to(model_device)
+                    chatterbox_model.t3 = chatterbox_model.t3.to(model_device).eval()
+                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(model_device).eval()
+                    chatterbox_model.ve = chatterbox_model.ve.to(model_device).eval()
                     chatterbox_model.device = model_device
-                else:
+                elif not has_full_model:
                     logger.warning(
                         f"Local checkpoint path '{local_checkpoint}' exists but doesn't contain "
                         f"recognizable model files (ve.safetensors or model.safetensors). "
@@ -545,24 +564,27 @@ def synthesize(
         )
 
         # Call the core model's generate method
+        # Use bfloat16 autocast on CUDA for ~2x faster inference
+        autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if model_device == "cuda" else nullcontext()
         # Multilingual model requires language_id parameter
-        if loaded_model_type == "multilingual":
-            wav_tensor = chatterbox_model.generate(
-                text=text,
-                language_id=language,
-                audio_prompt_path=audio_prompt_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
-        else:
-            wav_tensor = chatterbox_model.generate(
-                text=text,
-                audio_prompt_path=audio_prompt_path,
-                temperature=temperature,
-                exaggeration=exaggeration,
-                cfg_weight=cfg_weight,
-            )
+        with autocast_ctx:
+            if loaded_model_type == "multilingual":
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    language_id=language,
+                    audio_prompt_path=audio_prompt_path,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                )
+            else:
+                wav_tensor = chatterbox_model.generate(
+                    text=text,
+                    audio_prompt_path=audio_prompt_path,
+                    temperature=temperature,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfg_weight,
+                )
 
         # The ChatterboxTTS.generate method already returns a CPU tensor.
         return wav_tensor, chatterbox_model.sr
@@ -645,19 +667,41 @@ def _stream_generate(
     Token-level streaming generator. Replicates the T3 KV-cache loop from
     ChatterboxTTS.generate() but yields decoded audio as tokens are produced.
     """
-    # --- Conditionals ---
+    import time as _time
+
+    # --- Conditionals (with caching) ---
+    _t0 = _time.perf_counter()
     if audio_prompt_path:
-        model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        _cached = _conditionals_cache.get(audio_prompt_path)
+        if _cached is not None:
+            model.conds = _cached
+            logger.debug(f"Using cached conditionals for: {audio_prompt_path}")
+        else:
+            model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            # Cache a deep copy of the conditionals
+            _conditionals_cache[audio_prompt_path] = Conditionals(
+                T3Cond(
+                    speaker_emb=model.conds.t3.speaker_emb.clone(),
+                    cond_prompt_speech_tokens=model.conds.t3.cond_prompt_speech_tokens.clone(),
+                    emotion_adv=model.conds.t3.emotion_adv.clone(),
+                ),
+                {k: v.clone() if torch.is_tensor(v) else v for k, v in model.conds.gen.items()},
+            )
+            logger.info(f"Cached conditionals for: {audio_prompt_path}")
     else:
         if model.conds is None:
             raise RuntimeError("No conditionals loaded. Provide audio_prompt_path or call prepare_conditionals first.")
-        if exaggeration != model.conds.t3.emotion_adv[0, 0, 0].item():
-            _cond = model.conds.t3
-            model.conds.t3 = T3Cond(
-                speaker_emb=_cond.speaker_emb,
-                cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
-            ).to(device=model.device)
+
+    # Always update exaggeration on the active conds
+    if model.conds is not None and exaggeration != model.conds.t3.emotion_adv[0, 0, 0].item():
+        _cond = model.conds.t3
+        model.conds.t3 = T3Cond(
+            speaker_emb=_cond.speaker_emb,
+            cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
+            emotion_adv=exaggeration * torch.ones(1, 1, 1),
+        ).to(device=model.device)
+    _t1 = _time.perf_counter()
+    logger.info(f"[stream-perf] conditionals: {(_t1-_t0)*1000:.1f}ms")
 
     # --- Tokenize (always duplicate for CFG batch) ---
     text = punc_norm(text)
@@ -670,7 +714,8 @@ def _stream_generate(
 
     t3 = model.t3
 
-    with torch.inference_mode():
+    autocast_ctx = torch.autocast("cuda", dtype=torch.bfloat16) if model.device == "cuda" else nullcontext()
+    with torch.inference_mode(), autocast_ctx:
         patched_model = T3HuggingfaceBackend(
             config=t3.cfg,
             llama=t3.tfmr,
@@ -700,19 +745,26 @@ def _stream_generate(
         min_p_proc     = MinPLogitsWarper(min_p=min_p)
         rep_penalty_proc = RepetitionPenaltyLogitsProcessor(penalty=float(repetition_penalty))
 
+        _t2 = _time.perf_counter()
+        logger.info(f"[stream-perf] prepare_embeds: {(_t2-_t1)*1000:.1f}ms")
+
         output = patched_model(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
+            output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
         )
         past = output.past_key_values
+        torch.cuda.synchronize()
+        _t3 = _time.perf_counter()
+        logger.info(f"[stream-perf] prefill: {(_t3-_t2)*1000:.1f}ms")
 
         # 1-D token accumulators for efficient slicing
         all_tokens = torch.empty(0, dtype=torch.long, device=device)
         chunk_buf   = torch.empty(0, dtype=torch.long, device=device)
+        _first_chunk = True
 
         for i in range(max_new_tokens):
             logits_step = output.logits[:, -1, :]
@@ -744,13 +796,23 @@ def _stream_generate(
             chunk_buf  = torch.cat([chunk_buf,  token_val])
             all_tokens = torch.cat([all_tokens, token_val])
 
+            # Use a smaller first chunk for lower TTFB, then normal chunk_size
+            _current_chunk_size = min(8, chunk_size) if _first_chunk else chunk_size
             # Yield when chunk buffer is full
-            if chunk_buf.numel() >= chunk_size:
+            if chunk_buf.numel() >= _current_chunk_size:
+                torch.cuda.synchronize()
+                _t4 = _time.perf_counter()
+                logger.info(f"[stream-perf] {chunk_buf.numel()} tokens generated: {(_t4-_t3)*1000:.1f}ms")
                 ctx_tokens = all_tokens[: all_tokens.numel() - chunk_buf.numel()]
                 audio = _decode_chunk(model, chunk_buf, ctx_tokens, context_window, device)
+                torch.cuda.synchronize()
+                _t5 = _time.perf_counter()
+                logger.info(f"[stream-perf] s3gen decode: {(_t5-_t4)*1000:.1f}ms")
                 if audio is not None:
                     yield audio, model.sr
                 chunk_buf = torch.empty(0, dtype=torch.long, device=device)
+                _first_chunk = False
+                _t3 = _time.perf_counter()
 
             # Advance KV-cache
             next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)
@@ -758,7 +820,7 @@ def _stream_generate(
             output = patched_model(
                 inputs_embeds=next_embed,
                 past_key_values=past,
-                output_attentions=True,
+                output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
             )
@@ -822,6 +884,9 @@ def reload_model() -> bool:
     global chatterbox_model, MODEL_LOADED, model_device, loaded_model_type, loaded_model_class_name
 
     logger.info("Initiating model hot-swap/reload sequence...")
+
+    # 0. Clear conditionals cache
+    _conditionals_cache.clear()
 
     # 1. Unload existing model
     if chatterbox_model is not None:
