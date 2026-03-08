@@ -1275,6 +1275,7 @@ async def stream_tts_generator(
     request: StreamTTSRequest,
     audio_prompt_path: Optional[str] = None,
     target_sample_rate: int = 24000,
+    request_id: str = "",
 ):
     """Async generator that yields audio chunks using token-level streaming.
     Uses asyncio.Queue + thread pattern to bridge sync generator with async response.
@@ -1282,6 +1283,7 @@ async def stream_tts_generator(
 
     output_format = request.output_format or "mulaw"
     is_mulaw = output_format == "mulaw"
+    stream_start = time.perf_counter()
 
     # Emit WAV header first for WAV format
     if not is_mulaw:
@@ -1297,11 +1299,18 @@ async def stream_tts_generator(
     context_window = request.context_window if request.context_window is not None else 50
     seed = request.seed if request.seed is not None else get_gen_default_seed()
 
+    logger.debug(
+        f"[{request_id}] Generator params | chunk_size={chunk_size} | "
+        f"context_window={context_window} | seed={seed}"
+    )
+
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
     def _run_stream():
         """Run the synchronous streaming generator in a thread, pushing chunks to the queue."""
+        chunk_count = 0
+        first_chunk_time = None
         try:
             for audio_chunk_tensor, sr in engine.synthesize_stream(
                 text=request.input,
@@ -1314,6 +1323,7 @@ async def stream_tts_generator(
                 context_window=context_window,
             ):
                 if audio_chunk_tensor is not None:
+                    chunk_count += 1
                     audio_np = audio_chunk_tensor.cpu().numpy().squeeze().astype(np.float32)
 
                     # Apply speed factor if needed
@@ -1325,9 +1335,24 @@ async def stream_tts_generator(
                         audio_np = audio_chunk_tensor_speed.cpu().numpy().squeeze().astype(np.float32)
 
                     encoded = _encode_chunk(audio_np, sr)
+
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter() - stream_start
+                        logger.info(
+                            f"[{request_id}] First chunk generated | "
+                            f"TTFB={first_chunk_time * 1000:.1f}ms | "
+                            f"size={len(encoded)} bytes"
+                        )
+
                     loop.call_soon_threadsafe(queue.put_nowait, encoded)
+
+            total_time = time.perf_counter() - stream_start
+            logger.info(
+                f"[{request_id}] Stream complete | "
+                f"chunks={chunk_count} | total_time={total_time * 1000:.1f}ms"
+            )
         except Exception as e:
-            logger.error(f"Streaming thread error: {e}", exc_info=True)
+            logger.error(f"[{request_id}] Streaming thread error: {e}", exc_info=True)
         finally:
             loop.call_soon_threadsafe(queue.put_nowait, None)  # Sentinel
 
@@ -1346,27 +1371,43 @@ async def stream_tts_generator(
 @app.post("/stream/audio/speech", tags=["TTS Generation"])
 async def tts_stream_endpoint(request: StreamTTSRequest):
     """Stream TTS audio as WAV chunks during generation for reduced time-to-first-sound."""
-    logger.info(f"Stream request received for: {request.input[:30]}...")
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(
+        f"[{request_id}] Stream request received | "
+        f"text='{request.input[:50]}{'...' if len(request.input) > 50 else ''}' | "
+        f"voice_id={request.voice_id} | format={request.output_format or 'mulaw'} | "
+        f"chunk_size={request.chunk_size} | seed={request.seed} | "
+        f"temp={request.temperature} | exag={request.exaggeration} | "
+        f"cfg={request.cfg_weight} | speed={request.speed_factor}"
+    )
+
     audio_prompt_path_str = None
     if request.voice_id:
         # Look for voice file in predefined voices directory (append .wav like chatterbox-streaming)
         p = get_predefined_voices_path(ensure_absolute=True) / (request.voice_id + ".wav")
         if p.exists():
             audio_prompt_path_str = str(p)
+            logger.debug(f"[{request_id}] Voice found in predefined voices: {p}")
         else:
             # Also check reference audio directory
             p = get_reference_audio_path(ensure_absolute=True) / (request.voice_id + ".wav")
             if p.exists():
                 audio_prompt_path_str = str(p)
+                logger.debug(f"[{request_id}] Voice found in reference audio: {p}")
+            else:
+                logger.warning(f"[{request_id}] Voice '{request.voice_id}' not found in any directory")
 
     if not engine.MODEL_LOADED:
+        logger.error(f"[{request_id}] Model not loaded, returning 503")
         raise HTTPException(status_code=503, detail="Model not loaded")
 
     target_sr = request.output_sample_rate or get_audio_sample_rate()
     output_format = request.output_format or "mulaw"
     media_type = "audio/x-mulaw" if output_format == "mulaw" else "audio/wav"
+
+    logger.info(f"[{request_id}] Starting stream | sample_rate={target_sr} | media_type={media_type}")
     return StreamingResponse(
-        stream_tts_generator(request, audio_prompt_path_str, target_sr),
+        stream_tts_generator(request, audio_prompt_path_str, target_sr, request_id),
         media_type=media_type,
     )
 
