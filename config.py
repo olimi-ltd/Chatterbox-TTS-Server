@@ -11,6 +11,9 @@ from threading import Lock
 from typing import Dict, Any, Optional, List, Tuple
 import torch  # For automatic CUDA/CPU device detection
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Standard logger setup
 logger = logging.getLogger(__name__)
@@ -710,14 +713,20 @@ def _get_default_from_structure(key_path: str) -> Any:
 
 # Server Settings Accessors
 def get_host() -> str:
-    """Returns the server host address."""
+    """Returns the server host address. ENV var SERVER_HOST takes precedence."""
+    env_host = os.environ.get("SERVER_HOST")
+    if env_host:
+        return env_host
     return config_manager.get_string(
         "server.host", _get_default_from_structure("server.host")
     )
 
 
 def get_port() -> int:
-    """Returns the server port number."""
+    """Returns the server port number. ENV var SERVER_PORT takes precedence."""
+    env_port = os.environ.get("SERVER_PORT")
+    if env_port:
+        return int(env_port)
     return config_manager.get_int(
         "server.port", _get_default_from_structure("server.port")
     )

@@ -1,7 +1,12 @@
+import os
 import time
 import requests
+from dotenv import load_dotenv
 
-URL = "http://localhost:8004/stream/audio/speech"
+load_dotenv()
+
+PORT = os.environ.get("SERVER_PORT", "8004")
+URL = f"http://localhost:{PORT}/stream/audio/speech"
 OUTPUT_FILE = "outputs/output_stream.mulaw"
 PAYLOAD = {
     "input": "صباح الخير",
