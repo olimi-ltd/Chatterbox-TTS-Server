@@ -346,29 +346,63 @@ def load_model() -> bool:
                 checkpoint_path = Path(local_checkpoint)
 
                 # Check if this is a full model directory or just fine-tuned weights
-                has_full_model = (checkpoint_path / "ve.safetensors").exists()
+                # Check what files are available in the checkpoint directory
+                has_ve = (checkpoint_path / "ve.safetensors").exists() or (checkpoint_path / "ve.pt").exists()
+                has_t3_named = (checkpoint_path / "t3_mtl23ls_v2.safetensors").exists()
                 has_finetuned_weights = (checkpoint_path / "model.safetensors").exists()
+                has_mtl_tokenizer = (checkpoint_path / "mtl_tokenizer.json").exists()
 
-                if has_full_model:
-                    # Full model directory - load directly
-                    logger.info(f"Loading complete model from local checkpoint: {local_checkpoint}")
-                    chatterbox_model = model_class.from_local(
-                        ckpt_dir=local_checkpoint,
-                        device=model_device
-                    )
+                if has_ve and has_t3_named:
+                    # NAMAA-style full model: load base model, then replace T3 with named checkpoint
+                    logger.info(f"Loading base model from HuggingFace, then applying T3 weights from: {checkpoint_path / 't3_mtl23ls_v2.safetensors'}")
+                    chatterbox_model = model_class.from_pretrained(device="cpu")
+
+                    t3_state = load_file(str(checkpoint_path / "t3_mtl23ls_v2.safetensors"))
+                    if "model" in t3_state.keys():
+                        t3_state = t3_state["model"][0]
+                    chatterbox_model.t3.load_state_dict(t3_state)
+                    logger.info("Successfully loaded T3 weights from t3_mtl23ls_v2.safetensors")
+
+                    if has_mtl_tokenizer:
+                        from chatterbox.models.tokenizers.tokenizer import MTLTokenizer
+                        logger.info(f"Loading MTL tokenizer from: {checkpoint_path / 'mtl_tokenizer.json'}")
+                        chatterbox_model.tokenizer = MTLTokenizer(str(checkpoint_path / "mtl_tokenizer.json"))
+                        logger.info("MTL tokenizer loaded successfully")
+
+                    local_conds_path = checkpoint_path / "conds.pt"
+                    if local_conds_path.exists():
+                        from chatterbox.tts import Conditionals
+                        logger.info(f"Loading conditionals from: {local_conds_path}")
+                        chatterbox_model.conds = Conditionals.load(local_conds_path, map_location="cpu")
+
+                    logger.info(f"Moving model to device: {model_device} (T3 in float16, S3Gen/VE in float32)")
+                    chatterbox_model.t3 = chatterbox_model.t3.to(device=model_device, dtype=torch.float16).eval()
+                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(device=model_device).eval()
+                    chatterbox_model.ve = chatterbox_model.ve.to(device=model_device).eval()
+                    if chatterbox_model.conds is not None:
+                        chatterbox_model.conds = chatterbox_model.conds.to(model_device)
+                        # Cast float tensors in conds to float16 to match model
+                        if hasattr(chatterbox_model.conds, 't3'):
+                            t3c = chatterbox_model.conds.t3
+                            for attr in ['speaker_emb', 'emotion_adv', 'cond_prompt_speech_emb', 'clap_emb']:
+                                val = getattr(t3c, attr, None)
+                                if isinstance(val, torch.Tensor) and val.is_floating_point():
+                                    setattr(t3c, attr, val.to(torch.float16))
+                        if hasattr(chatterbox_model.conds, 'gen') and isinstance(chatterbox_model.conds.gen, dict):
+                            for k, v in chatterbox_model.conds.gen.items():
+                                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                                    chatterbox_model.conds.gen[k] = v.to(torch.float16)
+                    chatterbox_model.device = model_device
+
                 elif has_finetuned_weights:
-                    # Only fine-tuned weights - load base model and replace T3 module
-                    # This handles fine-tuned models with extended vocabularies (e.g., for Arabic)
+                    # Fine-tuned weights only (model.safetensors)
                     logger.info(f"Loading base model from HuggingFace and applying fine-tuned weights from: {local_checkpoint}")
-                    chatterbox_model = model_class.from_pretrained(device="cpu")  # Load to CPU first
+                    chatterbox_model = model_class.from_pretrained(device="cpu")
 
-                    # Load the fine-tuned T3 weights
                     finetuned_weights_path = checkpoint_path / "model.safetensors"
                     logger.info(f"Loading fine-tuned T3 weights from: {finetuned_weights_path}")
                     finetuned_state_dict = load_file(str(finetuned_weights_path))
 
-                    # Detect vocabulary size from the text embedding layer
-                    # The text_emb.weight tensor has shape [vocab_size, embed_dim]
                     vocab_size = None
                     for key in finetuned_state_dict.keys():
                         if 'text_emb.weight' in key:
@@ -376,69 +410,73 @@ def load_model() -> bool:
                             logger.info(f"Detected vocabulary size from checkpoint: {vocab_size}")
                             break
 
-                    if vocab_size is not None and vocab_size != chatterbox_model.t3.hp.text_tokens_dict_size:
-                        # Extended vocabulary detected - need to create new T3 module
-                        logger.info(f"Fine-tuned model has extended vocabulary (base: {chatterbox_model.t3.hp.text_tokens_dict_size}, fine-tuned: {vocab_size})")
-                        logger.info("Creating new T3 module with extended vocabulary...")
+                    # Strip "t3." prefix from keys if present
+                    cleaned_state_dict = {}
+                    for key, value in finetuned_state_dict.items():
+                        if key.startswith('t3.'):
+                            cleaned_state_dict[key[3:]] = value
+                        else:
+                            cleaned_state_dict[key] = value
 
-                        # Import T3 class
+                    if vocab_size is not None and vocab_size != chatterbox_model.t3.hp.text_tokens_dict_size:
+                        logger.info(f"Fine-tuned model has extended vocabulary (base: {chatterbox_model.t3.hp.text_tokens_dict_size}, fine-tuned: {vocab_size})")
                         try:
                             from chatterbox.models.t3.t3 import T3
                         except ImportError:
-                            logger.error("Failed to import T3 class. Cannot create extended vocabulary T3.")
+                            logger.error("Failed to import T3 class.")
                             raise
-
-                        # Get T3 config and update vocab size
                         t3_config = chatterbox_model.t3.hp
                         t3_config.text_tokens_dict_size = vocab_size
-
-                        # Create new T3 with extended vocabulary
                         new_t3 = T3(hp=t3_config)
-
-                        # Strip "t3." prefix from keys if present
-                        cleaned_state_dict = {}
-                        for key, value in finetuned_state_dict.items():
-                            if key.startswith('t3.'):
-                                cleaned_key = key[3:]  # Remove "t3." prefix
-                                cleaned_state_dict[cleaned_key] = value
-                            else:
-                                cleaned_state_dict[key] = value
-
-                        logger.info(f"Cleaned {len(finetuned_state_dict)} checkpoint keys (removed 't3.' prefix where present)")
-
-                        # Load the fine-tuned weights into the new T3
                         new_t3.load_state_dict(cleaned_state_dict, strict=True)
-                        logger.info("Successfully loaded fine-tuned weights into new T3 module with extended vocabulary")
-
-                        # Replace the T3 module in the model
+                        logger.info("Successfully loaded fine-tuned weights into new T3 with extended vocabulary")
                         chatterbox_model.t3 = new_t3
                     else:
-                        # No vocab size change, load weights directly
-                        logger.info("Vocabulary size unchanged, loading weights into existing T3 module")
-                        chatterbox_model.t3.load_state_dict(finetuned_state_dict, strict=False)
+                        logger.info("Loading fine-tuned weights into existing T3 module")
+                        chatterbox_model.t3.load_state_dict(cleaned_state_dict, strict=True)
                         logger.info("Successfully loaded fine-tuned T3 weights into base model")
 
-                    # Load extended tokenizer if present in checkpoint directory
-                    custom_tokenizer_path = checkpoint_path / "tokenizer.json"
-                    if custom_tokenizer_path.exists():
-                        from chatterbox.models.tokenizers.tokenizer import EnTokenizer
-                        logger.info(f"Loading custom tokenizer from: {custom_tokenizer_path}")
-                        chatterbox_model.tokenizer = EnTokenizer(str(custom_tokenizer_path))
-                        logger.info(f"Custom tokenizer loaded (vocab size: {len(chatterbox_model.tokenizer.tokenizer.get_vocab())})")
+                    if has_mtl_tokenizer:
+                        from chatterbox.models.tokenizers.tokenizer import MTLTokenizer
+                        logger.info(f"Loading MTL tokenizer from: {checkpoint_path / 'mtl_tokenizer.json'}")
+                        chatterbox_model.tokenizer = MTLTokenizer(str(checkpoint_path / "mtl_tokenizer.json"))
                     else:
-                        logger.warning("No custom tokenizer.json found in checkpoint directory. Using base tokenizer - this may cause issues with extended vocabularies!")
+                        custom_tokenizer_path = checkpoint_path / "tokenizer.json"
+                        if custom_tokenizer_path.exists():
+                            from chatterbox.models.tokenizers.tokenizer import EnTokenizer
+                            logger.info(f"Loading custom tokenizer from: {custom_tokenizer_path}")
+                            chatterbox_model.tokenizer = EnTokenizer(str(custom_tokenizer_path))
+                        else:
+                            logger.warning("No custom tokenizer found. Using base tokenizer.")
 
-                    # Move entire model to the target device
-                    logger.info(f"Moving model to device: {model_device}")
-                    chatterbox_model.t3 = chatterbox_model.t3.to(model_device)
-                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(model_device)
-                    chatterbox_model.ve = chatterbox_model.ve.to(model_device)
+                    local_conds_path = checkpoint_path / "conds.pt"
+                    if local_conds_path.exists():
+                        from chatterbox.tts import Conditionals
+                        logger.info(f"Loading conditionals from: {local_conds_path}")
+                        chatterbox_model.conds = Conditionals.load(local_conds_path, map_location="cpu")
+
+                    logger.info(f"Moving model to device: {model_device} (T3 in float16, S3Gen/VE in float32)")
+                    chatterbox_model.t3 = chatterbox_model.t3.to(device=model_device, dtype=torch.float16).eval()
+                    chatterbox_model.s3gen = chatterbox_model.s3gen.to(device=model_device).eval()
+                    chatterbox_model.ve = chatterbox_model.ve.to(device=model_device).eval()
+                    if chatterbox_model.conds is not None:
+                        chatterbox_model.conds = chatterbox_model.conds.to(model_device)
+                        # Cast float tensors in conds to float16 to match model
+                        if hasattr(chatterbox_model.conds, 't3'):
+                            t3c = chatterbox_model.conds.t3
+                            for attr in ['speaker_emb', 'emotion_adv', 'cond_prompt_speech_emb', 'clap_emb']:
+                                val = getattr(t3c, attr, None)
+                                if isinstance(val, torch.Tensor) and val.is_floating_point():
+                                    setattr(t3c, attr, val.to(torch.float16))
+                        if hasattr(chatterbox_model.conds, 'gen') and isinstance(chatterbox_model.conds.gen, dict):
+                            for k, v in chatterbox_model.conds.gen.items():
+                                if isinstance(v, torch.Tensor) and v.is_floating_point():
+                                    chatterbox_model.conds.gen[k] = v.to(torch.float16)
                     chatterbox_model.device = model_device
                 else:
                     logger.warning(
                         f"Local checkpoint path '{local_checkpoint}' exists but doesn't contain "
-                        f"recognizable model files (ve.safetensors or model.safetensors). "
-                        f"Falling back to loading from HuggingFace Hub."
+                        f"recognizable model files. Falling back to loading from HuggingFace Hub."
                     )
                     chatterbox_model = model_class.from_pretrained(device=model_device)
             else:
@@ -653,16 +691,19 @@ def _stream_generate(
             raise RuntimeError("No conditionals loaded. Provide audio_prompt_path or call prepare_conditionals first.")
         if exaggeration != model.conds.t3.emotion_adv[0, 0, 0].item():
             _cond = model.conds.t3
+            emotion_tensor = exaggeration * torch.ones(1, 1, 1, device=model.device, dtype=_cond.speaker_emb.dtype)
             model.conds.t3 = T3Cond(
                 speaker_emb=_cond.speaker_emb,
                 cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-                emotion_adv=exaggeration * torch.ones(1, 1, 1),
+                emotion_adv=emotion_tensor,
             ).to(device=model.device)
 
-    # --- Tokenize (always duplicate for CFG batch) ---
+    # --- Tokenize ---
+    use_cfg = cfg_weight > 0.1
     text = punc_norm(text)
     text_tokens = model.tokenizer.text_to_tokens(text).to(model.device)
-    text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # batch=2 for CFG
+    if use_cfg:
+        text_tokens = torch.cat([text_tokens, text_tokens], dim=0)  # batch=2 for CFG
     sot = model.t3.hp.start_text_token
     eot = model.t3.hp.stop_text_token
     text_tokens = F.pad(text_tokens, (1, 0), value=sot)
@@ -684,14 +725,15 @@ def _stream_generate(
             t3_cond=model.conds.t3,
             text_tokens=text_tokens,
             speech_tokens=initial_speech,
-            cfg_weight=cfg_weight,
+            cfg_weight=cfg_weight if use_cfg else 0.0,
         )
 
         device = embeds.device
 
         bos_token = torch.tensor([[t3.hp.start_speech_token]], dtype=torch.long, device=device)
         bos_embed = t3.speech_emb(bos_token) + t3.speech_pos_emb.get_fixed_embedding(0)
-        bos_embed = torch.cat([bos_embed, bos_embed])
+        if use_cfg:
+            bos_embed = torch.cat([bos_embed, bos_embed])
         inputs_embeds = torch.cat([embeds, bos_embed], dim=1)
 
         generated_ids = bos_token.clone()
@@ -704,7 +746,7 @@ def _stream_generate(
             inputs_embeds=inputs_embeds,
             past_key_values=None,
             use_cache=True,
-            output_attentions=True,
+            output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
         )
@@ -716,9 +758,12 @@ def _stream_generate(
 
         for i in range(max_new_tokens):
             logits_step = output.logits[:, -1, :]
-            cond   = logits_step[0:1, :]
-            uncond = logits_step[1:2, :]
-            logits = cond + cfg_weight * (cond - uncond)
+            if use_cfg:
+                cond   = logits_step[0:1, :]
+                uncond = logits_step[1:2, :]
+                logits = cond + cfg_weight * (cond - uncond)
+            else:
+                logits = logits_step[0:1, :]
 
             ids_for_proc = generated_ids[:1, ...]
             if temperature != 1.0:
@@ -754,11 +799,12 @@ def _stream_generate(
 
             # Advance KV-cache
             next_embed = t3.speech_emb(next_token) + t3.speech_pos_emb.get_fixed_embedding(i + 1)
-            next_embed = torch.cat([next_embed, next_embed])
+            if use_cfg:
+                next_embed = torch.cat([next_embed, next_embed])
             output = patched_model(
                 inputs_embeds=next_embed,
                 past_key_values=past,
-                output_attentions=True,
+                output_attentions=False,
                 output_hidden_states=True,
                 return_dict=True,
             )

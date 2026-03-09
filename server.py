@@ -1298,9 +1298,12 @@ async def stream_tts_generator(
 
     queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
+    import time as _time
+    stream_start = _time.monotonic()
 
     def _run_stream():
         """Run the synchronous streaming generator in a thread, pushing chunks to the queue."""
+        chunk_count = 0
         try:
             for audio_chunk_tensor, sr in engine.synthesize_stream(
                 text=request.text,
@@ -1313,6 +1316,11 @@ async def stream_tts_generator(
                 context_window=context_window,
             ):
                 if audio_chunk_tensor is not None:
+                    chunk_count += 1
+                    if chunk_count == 1:
+                        ttfb = (_time.monotonic() - stream_start) * 1000
+                        logger.info(f"First audio chunk generated | TTFB={ttfb:.1f}ms")
+
                     audio_np = audio_chunk_tensor.cpu().numpy().squeeze().astype(np.float32)
 
                     # Apply speed factor if needed
@@ -1328,6 +1336,8 @@ async def stream_tts_generator(
         except Exception as e:
             logger.error(f"Streaming thread error: {e}", exc_info=True)
         finally:
+            total = (_time.monotonic() - stream_start) * 1000
+            logger.info(f"Stream complete | chunks={chunk_count} | total_time={total:.1f}ms")
             loop.call_soon_threadsafe(queue.put_nowait, None)  # Sentinel
 
     # Start the streaming thread
