@@ -659,9 +659,6 @@ def _decode_chunk(
     if fade > 0:
         wav_np[:fade] *= np.linspace(0.0, 1.0, fade, dtype=wav_np.dtype)
 
-    # Watermark each chunk (matches non-streaming generate() behaviour)
-    wav_np = model.watermarker.apply_watermark(wav_np, sample_rate=model.sr)
-
     return torch.from_numpy(wav_np).unsqueeze(0)  # (1, samples)
 
 
@@ -673,7 +670,7 @@ def _stream_generate(
     exaggeration: float = 0.5,
     cfg_weight: float = 0.5,
     chunk_size: int = 25,
-    context_window: int = 50,
+    context_window: int = 25,
     max_new_tokens: int = 1000,
     repetition_penalty: float = 1.2,
     min_p: float = 0.05,
@@ -686,6 +683,18 @@ def _stream_generate(
     # --- Conditionals ---
     if audio_prompt_path:
         model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+        # Cast conds to float16 if T3 is in float16
+        t3_dtype = next(model.t3.parameters()).dtype
+        if t3_dtype == torch.float16:
+            t3c = model.conds.t3
+            for attr in ['speaker_emb', 'emotion_adv', 'cond_prompt_speech_emb', 'clap_emb']:
+                val = getattr(t3c, attr, None)
+                if isinstance(val, torch.Tensor) and val.is_floating_point():
+                    setattr(t3c, attr, val.to(torch.float16))
+            if isinstance(model.conds.gen, dict):
+                for k, v in model.conds.gen.items():
+                    if isinstance(v, torch.Tensor) and v.is_floating_point():
+                        model.conds.gen[k] = v.to(torch.float16)
     else:
         if model.conds is None:
             raise RuntimeError("No conditionals loaded. Provide audio_prompt_path or call prepare_conditionals first.")
@@ -819,7 +828,7 @@ def synthesize_stream(
     cfg_weight: float = 0.5,
     seed: int = 0,
     chunk_size: int = 25,
-    context_window: int = 50,
+    context_window: int = 25,
 ) -> Generator[Tuple[torch.Tensor, int], None, None]:
     """
     Token-level streaming synthesis. Yields (audio_chunk_tensor, sample_rate) tuples

@@ -64,6 +64,7 @@ from config import (
 import engine  # TTS Engine interface
 from models import (  # Pydantic models
     CustomTTSRequest,
+    StreamTTSRequest,
     ErrorResponse,
     UpdateStatusResponse,
 )
@@ -164,6 +165,19 @@ async def lifespan(app: FastAPI):
                 daemon=True,
             )
             browser_thread.start()
+
+        # Pre-warm the model with a short inference to compile CUDA kernels
+        if engine.chatterbox_model is not None:
+            try:
+                logger.info("Pre-warming model with dummy inference...")
+                import time as _time
+                warm_start = _time.monotonic()
+                for _ in engine.synthesize_stream(text="test", chunk_size=5):
+                    break  # Just need one chunk to warm up
+                warm_time = (_time.monotonic() - warm_start) * 1000
+                logger.info(f"Model pre-warm complete in {warm_time:.0f}ms")
+            except Exception as e_warm:
+                logger.warning(f"Pre-warm failed (non-critical): {e_warm}")
 
         logger.info("Application startup sequence complete.")
         startup_complete_event.set()
@@ -1380,6 +1394,60 @@ async def tts_stream_endpoint(request: CustomTTSRequest):
     media_type = "audio/x-mulaw" if output_format == "mulaw" else "audio/wav"
     return StreamingResponse(
         stream_tts_generator(request, audio_prompt_path_str, target_sr),
+        media_type=media_type,
+    )
+
+
+@app.post("/stream/audio/speech", tags=["TTS Generation"])
+async def stream_audio_speech_endpoint(request: StreamTTSRequest):
+    """Stream TTS audio using the chatterbox-streaming compatible API.
+    Accepts 'input' and 'voice_id' fields."""
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(
+        f"[{request_id}] Stream request received | "
+        f"text='{request.input[:50]}{'...' if len(request.input) > 50 else ''}' | "
+        f"voice_id={request.voice_id} | format={request.output_format or 'mulaw'} | "
+        f"chunk_size={request.chunk_size}"
+    )
+
+    audio_prompt_path_str = None
+    if request.voice_id:
+        # Look for voice file in predefined voices directory (append .wav)
+        p = get_predefined_voices_path(ensure_absolute=True) / (request.voice_id + ".wav")
+        if p.exists():
+            audio_prompt_path_str = str(p)
+        else:
+            p = get_reference_audio_path(ensure_absolute=True) / (request.voice_id + ".wav")
+            if p.exists():
+                audio_prompt_path_str = str(p)
+            else:
+                logger.warning(f"[{request_id}] Voice '{request.voice_id}' not found")
+
+    if not engine.MODEL_LOADED:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    target_sr = request.output_sample_rate or get_audio_sample_rate()
+    output_format = request.output_format or "mulaw"
+    media_type = "audio/x-mulaw" if output_format == "mulaw" else "audio/wav"
+
+    # Map StreamTTSRequest to CustomTTSRequest for the shared generator
+    custom_request = CustomTTSRequest(
+        text=request.input,
+        voice_mode="predefined",
+        predefined_voice_id=None,
+        output_format=output_format,
+        chunk_size=request.chunk_size,
+        context_window=request.context_window,
+        temperature=request.temperature,
+        exaggeration=request.exaggeration,
+        cfg_weight=request.cfg_weight,
+        seed=request.seed,
+        speed_factor=request.speed_factor,
+        language=request.language_id,
+    )
+
+    return StreamingResponse(
+        stream_tts_generator(custom_request, audio_prompt_path_str, target_sr),
         media_type=media_type,
     )
 
